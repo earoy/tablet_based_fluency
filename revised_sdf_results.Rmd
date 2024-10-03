@@ -1,0 +1,1550 @@
+---
+title: "Revised SDF Results"
+author: "Ethan Roy"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(sjPlot)
+library(cocor)
+library(sjmisc)
+library(lme4)
+library(MuMIn)
+library(lmerTest)
+require(data.table)
+require(jtools)
+library(nonpar)
+library(lavaan)
+library(psych)
+library(emmeans)
+library(lsr)
+library(effectsize)
+library(corrplot)
+library(ggpubr)
+library(boot)
+library(patchwork)
+library(mgcv)
+library(purrr)
+library(lmtest)
+library(numbers)
+
+select<-dplyr::select
+library(r2glmm)
+
+# Helper function for pulling out individual effect sizes
+effect_size_calc = function(mod){
+  
+  anova_df = data.frame(anova(mod))
+  effect_df = r2beta(mod, partial = TRUE)
+  effect_df = data.frame(effect_df) 
+  
+  return(effect_df)
+  
+}
+
+# Helper Function for Generating Split-Half Reliability
+gen_cor = function(df, cutoff) {
+  
+  # Original correlation without bootstrapping
+  original_corr = df %>% 
+    filter(trial_onset/1000 < cutoff) %>% 
+    select(pid,timepoint,firstButtonRT, answered_correctly) %>% 
+    group_by(pid) %>% 
+    mutate(set = mod(row_number(),2))%>% 
+    group_by(pid,set) %>% 
+    dplyr::summarise(count = n(), 
+              sum_corr = sum(answered_correctly, na.rm = T),
+              mean_rt = mean(firstButtonRT, na.rm = T), 
+              rcs = (1000*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>% 
+    ungroup() %>% 
+    select(pid, sum_corr,set) %>% 
+    pivot_wider(names_from = 'set',values_from = 'sum_corr',names_prefix = 'set_')%>% 
+    select(set_0,set_1)%>% 
+    cor(use='pairwise.complete.obs')
+  
+  # perform spearman-brown adjustment on correlation
+  spearman_brown_corr = (2*original_corr[1, 2])/(1+original_corr[1, 2])
+    
+  result = list(
+    original_corr = spearman_brown_corr
+  )
+  
+  return(result)
+}
+
+# Helper Function for Generating Criterion Validity (Prediciting SBAC)
+gen_val = function(df, cutoff) {
+  
+  # Original ICC without bootstrapping
+  mod_data = df %>% 
+      filter(trial_onset/1000<cutoff) %>%
+    group_by(pid,timepoint,sbac) %>%
+    dplyr::summarise(count = n(),
+              sum_corr = sum(answered_correctly, na.rm = T),
+              mean_rt = mean(rt, na.rm = T),
+              rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+    ungroup() %>% 
+    mutate(timepoint = timepoint)
+  
+    # Baseline model
+    m1 <- lmer(sbac ~ timepoint + (1 | pid) ,
+               data = mod_data, REML = F)
+    summary_m1 <- summary(m1)
+    varcomp_m1 <- VarCorr(m1)
+    varcomp_m1 <- as.data.frame(varcomp_m1, comp = "Variance")[1,4]
+
+    # Model 2: Add math fluency rcs
+    m2a <- lmer(sbac ~ timepoint + rcs + (1 | pid),
+               data = mod_data, REML = F)
+    
+    # Calculate Change Variance explained by rcs
+    summary_m2a <- summary(m2a)
+    varcomp_m2a <- VarCorr(m2a)
+    varcomp_m2a <- as.data.frame(varcomp_m2a, comp = "Variance")[1,4]
+
+    r2_m2a <- (varcomp_m1 - varcomp_m2a) / varcomp_m1
+  
+  result = list(
+    original_val = r2_m2a
+  )
+  
+  return(result)
+}
+
+```
+
+
+# Load and Merge Data
+
+```{r, include=F}
+
+## if this isn't present, run math_fluency_cleaning.R
+full_df = read_csv('/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/most updated data/sea_math_fluency_cleaned.csv')
+
+# format timepoint and make sure we only have single digit responses
+full_df = full_df %>% mutate(firstButtonRT=firstButtonRT/1000,
+                             timepoint = case_when(timepoint == "t0_Fall2016" ~ 0,
+                               timepoint == "t1_Spring2017" ~ 1,
+                               timepoint == "t2_Fall2017" ~ 2,
+                               timepoint == "t3_Spring2018" ~ 3)) %>% 
+  filter(correct_response<10 & correct_response>=0) 
+
+
+# Load item level information
+#  A tibble: 105 × 4
+#    item  fluency_type class    operation  
+#    <chr> <chr>        <chr>    <chr>      
+#  1 3+3=  Rule         Tie      Addition   
+#  2 0+1=  Rule         One_Op   Addition   
+#  3 0+4=  Rule         Identity Addition  
+item_info_df = read_csv('/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/Paper_1_Methods/item_info.csv',show_col_types = FALSE)
+
+# Add item level information to full dataframe
+full_df = full_df %>% 
+  mutate(item = paste0(gsub(' ', '', question_text),'=')) %>% 
+  full_join(item_info_df %>% 
+              select(item,class),
+            by='item')  %>%
+  mutate(class = case_when(class=='One_Op'~'OneOp', T~class)) 
+
+# Only select the columns we want
+full_df = full_df %>%
+  select(pid,timepoint,question_text,firstButtonRT,answered_correctly,
+         module,class,operation_type,operand_distance,set_size,cohort,
+         correct_response,grade,age_years,trial_onset,rt) %>% 
+  mutate(op_dist_bin = case_when(operand_distance >=5~'Large',
+                                 operand_distance < 5~'Small')) 
+
+# Load demographic and EF information
+low_income_df = read.csv('low_income_df.csv')
+
+# Load information about student school/classroom membership
+class_info_df = read.csv('/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/most updated data/student_class_info.csv')
+
+## Demographic/Academic Data
+# Load EF and SBAC data
+abcd_or <- read_csv("/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/data-selected/criticalValuesALL_averaged_data_consentcheck_2019-02-01 (1) (1).csv",
+                 n_max = 4247)
+
+colnames(abcd_or) <- gsub(".", "_", colnames(abcd_or), fixed = TRUE)
+colnames(abcd_or) <- tolower(colnames(abcd_or))
+
+abcd <- abcd_or %>%
+  dplyr::rename(math_q2_2017 = x2017_math_q2_lettergrade,
+         math_q4_2017 = x2017_math_q4_lettergrade,
+         math_q2_2018 = x2018_math_q2_lettergrade,
+         math_q4_2018 = x20_18_math_q4_lettergrade) %>%
+  dplyr::mutate(time = case_when(time_point == "T1_Fall2016" ~ 0,
+                          time_point == "T2_Spring2017" ~ 1,
+                          time_point == "T3_Fall2017" ~ 2,
+                          time_point == "T4_Spring2018" ~ 3),
+         year = case_when(time == "0" | time == "1" ~ 1,
+                          time == "2" | time == "3" ~ 2),
+         math_fluency_acc_rt = (math_fluency_rt_count_correct / 3),
+         grade_x = ifelse(is.na(grade_x), grade_y, grade_x),
+         grade_x = ifelse(is.na(grade_x), grade, grade_x),
+         sbacDiff = x2018_math_sbac_ss- x2017_math_sbac_ss) %>%
+         select(pid, sex,grade_x,year,time_point,
+         x2017_math_sbac_ss,
+         x2018_math_sbac_ss,
+         sbacDiff,
+         sex,
+         ethnicity,
+         age_x,
+         math_q2_2017,
+         math_q4_2017,
+         math_q2_2018,
+         math_q4_2018,
+         language_fluency,
+         flanker_rcs_overall,
+         low_income,
+         parent_ed_lvl,time,
+         x2017_math_sbac_pl,
+         x2018_math_sbac_pl,
+         backwardsspatialspan_object_count_span_overall,
+         stroop_rcs_congruent,
+         stroop_rcs_incongruent,
+         taskswitch_rcs_stay,
+         taskswitch_rcs_switch,
+         brt_rcs_overall,
+         math_fluency_acc_rt,
+         spatialspan_object_count_span_overall
+         )
+
+ef_df = abcd %>%
+  mutate(timepoint = case_when(time_point == "T1_Fall2016" ~ 0,
+                        time_point == "T2_Spring2017" ~ 1,
+                        time_point == "T3_Fall2017" ~ 2,
+                        time_point == "T4_Spring2018" ~ 3),
+         stroop_overall = (stroop_rcs_congruent+stroop_rcs_incongruent)/2) %>% 
+  select(pid,timepoint,brt_rcs_overall,flanker_rcs_overall,
+         spatialspan_object_count_span_overall,stroop_overall)
+
+demo_df = abcd %>% 
+  select(pid,low_income,sex,parent_ed_lvl)%>%
+  unique() %>% 
+  drop_na() %>%
+  mutate(low_income = ifelse(low_income=='Yes',1,0))
+
+# Generate SBAC data frame w/ quartiles
+sbac_df = abcd %>%
+  mutate(timepoint = case_when(time_point == "T1_Fall2016" ~ 0,
+                        time_point == "T2_Spring2017" ~ 1,
+                        time_point == "T3_Fall2017" ~ 2,
+                        time_point == "T4_Spring2018" ~ 3)) %>% 
+  select(pid,timepoint,contains('math_sbac')) %>%
+  unique() %>% 
+  drop_na() %>% 
+  inner_join(full_df %>% 
+               select(pid,grade,timepoint) %>%
+               unique(), 
+             by=c('pid','timepoint')) %>% 
+  group_by(grade,timepoint) %>% 
+  mutate(sbac_quartile_year_1 = ntile(x2017_math_sbac_ss,4),
+         sbac_quartile_year_2 = ntile(x2018_math_sbac_ss,4)) %>% 
+  mutate(sbac_quartile = case_when(timepoint==0~sbac_quartile_year_1,
+                                   timepoint==1~sbac_quartile_year_1,
+                                   timepoint==2~sbac_quartile_year_2,
+                                   timepoint==3~sbac_quartile_year_2),
+         sbac = case_when(timepoint==0~x2017_math_sbac_ss,
+                          timepoint==1~x2017_math_sbac_ss,
+                          timepoint==2~x2018_math_sbac_ss,
+                          timepoint==3~x2018_math_sbac_ss)) %>% 
+  select(pid,grade,timepoint,sbac_quartile,sbac) %>%
+  ungroup()
+
+# dataframe for criterion validity analysis
+full_df_sbac = full_df %>% 
+  inner_join(sbac_df %>% 
+               filter((timepoint==1)|(timepoint==3)),
+             by=c('pid','timepoint','grade'))
+
+# Create mereged dataframe for participants w SDF, Demos, and SBAC
+full_df_ses = full_df %>% 
+  filter(timepoint==0) %>% 
+  inner_join(demo_df, by='pid') %>% 
+  inner_join(sbac_df, by=c('pid','timepoint','grade'))
+
+
+# set up data frame for regressions
+sbac_mod_df = full_df_ses %>%
+  mutate(`Problem Type` = if_else(class=='Standard','Standard','Non-Standard')) %>%
+    filter(!is.na(class)) %>%
+    filter(module=='MATH_FLUENCY') %>%
+  filter(operand_distance!=8) %>%
+  group_by(pid, timepoint,grade,cohort,`Problem Type`,sbac,sbac_quartile) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  select(pid,timepoint,grade,cohort,`Problem Type`,sum_corr,rcs,sbac) %>%
+  pivot_wider(id_cols = c(pid,timepoint,grade,cohort,sbac),
+              names_from = `Problem Type`,
+              values_from = c(sum_corr,rcs)) %>%
+  mutate(sum_corr = `sum_corr_Non-Standard`+sum_corr_Standard) %>%
+  select(pid,timepoint,grade,cohort,sum_corr,rcs_Standard,`rcs_Non-Standard`,sbac) %>%
+  inner_join(ef_df, by = c('pid','timepoint'))%>%
+  inner_join(demo_df, by='pid') %>%
+  ungroup() %>% 
+  rename(`Spatial Span` = spatialspan_object_count_span_overall,
+         Flanker = flanker_rcs_overall,
+         Stroop = stroop_overall
+         ) %>% 
+  mutate_if(is.numeric, scale)
+
+# finalize data frames for other analyses
+full_df = full_df %>% 
+  dplyr::mutate(operands = lapply(str_extract_all(question_text,"\\d"),as.numeric)) %>% 
+  mutate(problem_size = as.numeric(lapply(operands, max))+as.numeric(lapply(operands, min))) %>% 
+  ungroup() %>% 
+  mutate(second_op = sapply(operands, function(x) x[2])) %>% 
+  select(-operands)%>% 
+  filter(timepoint==0)
+
+# full data including SES/SBAC info
+full_df_ses = full_df_ses %>% 
+ dplyr::mutate(operands = lapply(str_extract_all(question_text,"\\d"),as.numeric)) %>% 
+  mutate(problem_size = as.numeric(lapply(operands, max))+as.numeric(lapply(operands, min))) %>% 
+  ungroup() %>% 
+  mutate(second_op = sapply(operands, function(x) x[2])) %>% 
+  select(-operands) %>% 
+  filter(timepoint==0)
+
+```
+
+## Examine number of trials completed
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+## Range of completed trials: 17-51
+
+# get min number of trials
+full_df %>% 
+  group_by(pid) %>%
+  summarise(count=n()) %>%
+  select(count) %>% min()
+
+# get max number of trials
+full_df %>% 
+  group_by(pid) %>%
+  summarise(count=n()) %>%
+  select(count) %>% max()
+
+```
+
+
+## Check out missing data by school
+
+```{r, include=F}
+
+# Generate data frame with just participants who provided demo information
+parent_inc_df = abcd %>% 
+  inner_join(class_info_df %>% filter(timepoint==0) %>% 
+               select(pid, School,Teacher),
+             by='pid') %>% 
+  select(pid,low_income,sex,parent_ed_lvl, School,Teacher)%>%
+  unique() %>% 
+  mutate(missing = is.na(low_income)) %>%  # use this as a proxy -- all other demo info missing too
+  select(pid, missing, School,Teacher)
+
+# Get information about SDF completion and demo data
+missing_df = full_df %>% 
+  inner_join(parent_inc_df, by = 'pid') %>%
+  select(pid,missing,cohort,Teacher, School) %>%
+  unique() 
+
+# n = 824 with all data
+missing_df %>% 
+  filter(missing==F) %>% 
+  select(pid) %>% 
+  unique()
+
+# Calculate the proportion of participants at each school that are missing
+# demographic information
+missing_df %>% 
+  group_by(School) %>% 
+  mutate(count=n()) %>% 
+  ungroup() %>% 
+  group_by(missing, School) %>% 
+  summarise(prop = n()/count) %>% 
+  unique()
+
+```
+# Results
+
+## Evaluating the Reliability and Validity of the Single-Digit Fluency Assessment
+
+### Split-Half Reliability based on amount of data
+```{r, include=F}
+
+Seconds = seq(15, 180, by=15)
+splithalf_rel = data.frame(time=double(),
+                           corr=double(),
+                           boot_corr=double(),
+                           LCI=double(),
+                           UCI=double(),
+                           stringsAsFactors=T)
+
+# Loop through temporal cutoff points and calculate split-half reliability
+for (time in Seconds){
+  
+  split_half = gen_cor(full_df,time)
+  
+  res = as.data.frame(list(time=time, corr=split_half$original_corr))
+  
+  splithalf_rel = rbind(splithalf_rel,res)
+  
+}
+
+## Find point at which reliability does not increase by more than 1%
+d1 <- diff(splithalf_rel$corr)
+thresh_idx = which.min(d1 > 0.01) 
+
+thresh = splithalf_rel$time[thresh_idx]
+
+splithalf_plot = splithalf_rel %>% 
+  ggplot(aes(x=time,y=corr))+
+  geom_point(color='blue')+
+  geom_line(color='blue')+
+  geom_vline(xintercept=thresh,color='black',linetype=2)+
+  # geom_errorbar(aes(ymin=LCI, ymax=UCI),width=0.9, color='black')+
+  theme_classic()+
+  coord_cartesian(ylim = c(0.7, 1.00),
+                  xlim=c(0,200))+
+  ylab("Split-Half Reliability (Pearson's r)")+
+  xlab("Seconds")
+
+```
+
+### Predicting SBAC based on amount of data
+```{r, include=F}
+## Validity -- Predicting SBAC scores -- One minute
+Seconds = seq(15, 180, by=15)
+r2_df = data.frame(time=double(),
+                   r2=double(),
+                   stringsAsFactors=T)
+
+# Loop through temporal cutoff points and calculate change in variance for models
+# predicting SBAC scores
+for (time in Seconds){
+  
+  r2_boot_res = gen_val(full_df_sbac,
+                        time)
+  
+  res = as.data.frame(list(time=time, r2=r2_boot_res$original_val))
+  
+  r2_df = rbind(r2_df,res)
+  
+}
+
+## Find point at which r2 does not increase by more than 1%
+d2 <- diff(r2_df$r2)
+thresh_idx = which.min(d2 > 0.01) 
+
+thresh = r2_df$time[thresh_idx]
+
+# Generate Plot
+r2_plot = r2_df %>% 
+  ggplot(aes(x=time,y=r2))+
+  geom_point(color='red')+
+  geom_line(color='red')+
+  geom_vline(xintercept=r2_df$time[8],color='black',linetype=2)+
+  theme_classic()+
+  labs(y = bquote(R^2), x = "Seconds")
+```
+
+## Figure 1
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+# Figure 1
+(splithalf_plot | r2_plot)
+
+
+```
+
+# Chained-Fluency Assessment on a Tablet Replicates Known Effects from Discrete-Trials
+
+## Set Size By Operation Effects -- Main Text
+```{r setsize, echo = FALSE, message=FALSE, warning = FALSE}
+
+# Generate set size*operation plot -- Figure 2A
+setsize_plot = full_df_ses %>%
+  group_by(pid, cohort, problem_size,operation_type) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(cohort=as.factor(cohort+3+cohort)) %>% 
+  ggplot(aes(x = problem_size, y = rcs,
+             color=cohort,fill = cohort, group=cohort))+
+  geom_smooth(method='lm')+
+  ylab("Correct Responses per Minute")+
+  xlab("Set Size")+
+  labs(color = "Grade", fill = "Grade")+
+  # ggtitle("RPM by Set Size")+
+  theme_classic()+
+  facet_wrap(.~operation_type, scale='free_x')+
+  ylim(19,42)
+
+
+# Generate dataframe for regression model
+mod_data = full_df_ses %>%
+  group_by(pid, cohort, problem_size,operation_type) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup()
+
+# Fit model
+setsize_mod = lmer(rcs ~ problem_size*operation_type*cohort+(1|pid), data = mod_data)
+
+# Summarize effects
+summary(setsize_mod)
+
+# Effect Sizes
+
+effect_size_calc(setsize_mod) %>% 
+  select(Effect,Rsq)
+
+```
+
+
+### Problem Type Effect -- Main Text
+```{r problem_type, echo = FALSE, message=FALSE, warning = FALSE}
+
+# Generate problem type plot -- Figure 2B
+problem_type_plot_ses = full_df_ses %>%
+  mutate(`Problem Type` = if_else(class=='Standard','Common','Exceptional')) %>%
+  group_by(pid, grade,`Problem Type`) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(accuracy=sum_corr/count) %>%
+  group_by(grade,`Problem Type`) %>%
+  summarise(count=n(),
+            mean_rpm = mean(rcs, na.rm=T),
+            sd_rpm = sd(rcs, na.rm=T)) %>% 
+      mutate(se = sd_rpm/sqrt(count),
+             lower.ci = mean_rpm - qt(1 - (0.05 / 2), count - 1) * se,
+             upper.ci = mean_rpm + qt(1 - (0.05 / 2), count - 1) * se)%>%
+  ggplot(aes(x = grade, y = mean_rpm))+
+  geom_point(aes(color = `Problem Type`))+
+  geom_line(aes(color = `Problem Type`))+
+  geom_ribbon(aes(ymin=lower.ci,ymax=upper.ci,fill=`Problem Type`),alpha=0.25)+
+  ylab("Correct Responses per Minute")+
+  xlab("Grade")+
+  labs(color = "Problem Set", fill = "Problem Set")+
+  # ggtitle("RPM by Problem Type")+
+  theme_classic()+
+  ylim(19,42)
+
+# Generate data frame for regression models
+mod_data = full_df_ses %>%
+    mutate(ProblemType = if_else(class=='Standard','Common','Exceptional')) %>%
+  group_by(pid, cohort, ProblemType) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>% 
+  ungroup() 
+
+probTypeMod = lmer(rcs ~ ProblemType*cohort + (1|pid), data = mod_data)
+
+summary(probTypeMod)
+
+
+# Effect Sizes
+
+effect_size_calc(probTypeMod) %>% 
+  select(Effect,Rsq)
+
+```
+
+## Figure 2
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+# Generate Figure 2
+
+((setsize_plot|problem_type_plot_ses)) + plot_annotation(tag_levels = 'A') & theme(legend.position = 'bottom',
+                                                          legend.key.size = unit(0.6, 'cm'),
+                                                          legend.text = element_text(size=13),
+                                                          legend.title = element_text(size=13),
+                                                          plot.tag = element_text(size = 25))
+
+```
+
+
+
+## Corrected p-values
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+## Get FDR Corrected p-values for effects
+
+probSum = as.data.frame(summary(probTypeMod)$coefficients) %>% 
+  mutate(model="Problem Type")
+
+setSizeSum = as.data.frame(summary(setsize_mod)$coefficients) %>% 
+  mutate(model="SetSize")
+
+# Print adjusted p-values
+probSum %>% 
+  rbind(setSizeSum) %>% 
+  mutate(p.adj_fdr = p.adjust(`Pr(>|t|)`,"fdr"),
+         p.adj_bonf = p.adjust(`Pr(>|t|)`,"bonf")) %>% 
+  select(model, p.adj_fdr,p.adj_bonf)
+
+
+```
+
+
+# RPM Fluency Measures Better Predict Math Achievement than Traditional Raw Scores
+
+## Correlations
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+## Calculate and compare correlations
+
+
+mod_cor = sbac_mod_df %>% select(is.numeric) %>% 
+  select(c('rcs_Standard','rcs_Non-Standard','sum_corr','sbac'))%>% 
+  rename( RCS_Common=rcs_Standard,
+          RCS_Exceptional=`rcs_Non-Standard`,
+         `Total Correct`=sum_corr)%>% 
+  filter(!is.na(sbac)) 
+
+# raw correlations
+mod_cor %>% cor(use="pairwise.complete.obs")
+
+# z-transformed correlations
+corr_list = fisherz(mod_cor %>% cor(use="pairwise.complete.obs"))
+
+
+# Compare two correlations based on two independet groups
+
+print("Compare Rule/No-Rule correlations: ")
+cocor.dep.groups.overlap(r.jk=cor(mod_cor$sbac,mod_cor$`RCS_Common`)[1][1], 
+                         r.jh=cor(mod_cor$sbac,mod_cor$RCS_Exceptional)[1][1], 
+                         r.kh=cor(mod_cor$RCS_Exceptional,mod_cor$`RCS_Common`)[1][1], 
+                         n=length(unique(sbac_mod_df$pid)),
+                         alternative="two.sided", alpha=0.05, conf.level=0.95, null.value=0)
+
+print("Compare Total Correct/No-Rule correlations: ")
+cocor.dep.groups.overlap(r.jk=cor(mod_cor$sbac,mod_cor$`RCS_Common`)[1][1], 
+                         r.jh=cor(mod_cor$sbac,mod_cor$`Total Correct`)[1][1], 
+                         r.kh=cor(mod_cor$`Total Correct`,mod_cor$`RCS_Common`)[1][1], 
+                         n=length(unique(sbac_mod_df$pid)),
+                         alternative="two.sided", alpha=0.05, conf.level=0.95, null.value=0)
+
+print("Compare Rule/Total Correct correlations: ")
+cocor.dep.groups.overlap(r.jk=cor(mod_cor$sbac,mod_cor$`RCS_Exceptional`)[1][1], 
+                         r.jh=cor(mod_cor$sbac,mod_cor$`Total Correct`)[1][1], 
+                         r.kh=cor(mod_cor$`Total Correct`,mod_cor$`RCS_Exceptional`)[1][1], 
+                         n=length(unique(sbac_mod_df$pid)),
+                         alternative="two.sided", alpha=0.05, conf.level=0.95, null.value=0)
+
+
+```
+
+## Regression Models -- Table 1
+```{r,echo = FALSE, message=FALSE, warning = FALSE}
+
+# convert cohort to numeric
+sbac_mod_df$cohort = as.numeric(sbac_mod_df$cohort)
+
+# Total Correct Model
+mod1 = lm(sbac ~   cohort+low_income + brt_rcs_overall + Flanker + `Spatial Span`+sum_corr,
+          data = sbac_mod_df)
+
+#  Common RCS Model
+mod2 = lm(sbac ~cohort+low_income + brt_rcs_overall + Flanker + `Spatial Span`+rcs_Standard, 
+          data = sbac_mod_df)
+
+#  Exceptional RCS Model
+mod3 = lm(sbac ~  cohort+low_income + brt_rcs_overall + Flanker + `Spatial Span`+`rcs_Non-Standard`,
+          data = sbac_mod_df)
+
+# Common + Exceptional RCS Model 
+mod4 = lm(sbac ~  cohort+low_income + brt_rcs_overall + Flanker + `Spatial Span`+`rcs_Non-Standard`+rcs_Standard 
+          , data = sbac_mod_df)
+
+anova(mod2,mod3,mod4, test = "Chisq")
+# Compare non-nested models
+coxtest(mod1,mod4)
+
+
+# Table 1
+tab_model(mod1, mod2, mod3,mod4, auto.label = T,
+          p.style = "stars",
+          dv.labels = c("Total Correct", "Non-Standard", "Standard", "Non-Standard+Standard"),
+          show.ci = F,show.aic = T,show.loglik=T)
+
+
+```
+
+
+# Speed-Accuracy Tradeoffs Vary Based on Problem Type, Grade, and Math Achievement
+
+## SAT by Problem Type Overall -- Figure 3A
+
+```{r, include=F}
+
+# load SAT code --- From Domingue et al (2022)
+# This code is largely adapted from https://github.com/ben-domingue/rt_meta/tree/master/rtmeta_pkg/R
+source("speed_accuracy_tradeoff_code.R", local = knitr::knit_global())
+
+# Generate SAT data frame from full data and sbac dataframe
+full_df_sat = full_df_ses %>% 
+  # inner_join(sbac_df, by = c("pid","grade","timepoint")) %>% 
+  mutate(ProblemType = if_else(class=='Standard','Common','Exceptional')) %>%
+  mutate(sbac_decile = as.factor(ntile(sbac, 10)))
+
+# Run SAT analysis on Exceptional problems
+L = full_df_sat %>% 
+  gen_x_sdf() %>% 
+  qc() %>% 
+  irt() %>% 
+  interplay(nboot=100,nms=c("item","id","diff","th","pv","rt",
+                         'ProblemType','cohort','sbac_quartile'),
+            filter=c('ProblemType=="Exceptional"'))
+
+# Run SAT analysis on Common problems
+L2 = full_df_sat %>% 
+    mutate(ProblemType = if_else(class=='Standard','Common','Exceptional')) %>%
+  gen_x_sdf() %>% 
+  qc() %>% 
+  irt() %>% 
+  interplay(nboot=100,
+                   nms=c("item","id","diff","th","pv","rt",
+                         'ProblemType','cohort','sbac_quartile'),
+            filter=c('ProblemType=="Common"')) 
+
+# Plot SAT curves -- Figure 3A
+sat_plot = as.data.frame(L$pts) %>% 
+  rename('p(corr)'=V2,
+        'log(rt)'=V1) %>% 
+  mutate(ProblemType='Exceptional')%>% 
+  rbind(as.data.frame(L2$pts) %>% 
+  rename('p(corr)'=V2,
+        'log(rt)'=V1) %>% 
+  mutate(ProblemType='Common')) %>% 
+  mutate(rt = exp(`log(rt)`))%>% 
+  ggplot(aes(x=rt,y=`p(corr)`,color=ProblemType))+
+  geom_line()+
+  geom_ribbon(aes(ymin=cil,ymax=cih,fill=ProblemType),
+              alpha = 0.2,colour = NA)+
+  theme_classic()+
+  theme(legend.position = 'bottom')+
+  ylab("P(Correct)")+
+  xlab("Reaction Time")+
+  labs(color = "Problem Set", fill = "Problem Set")
+
+
+```
+
+### Compare R2 of linear and quadratic models to assess (non-)linearity of SAT curves
+
+```{r, include=F}
+
+# Build dataframe from SAT results to compare fits of models predicting
+# probability of a correct response from reaction time with either
+# linear term or quadratic term
+
+stats_df = as.data.frame(L$pts) %>%
+  rename('p(corr)'=V2,
+        'log(rt)'=V1) %>%
+  mutate(ProblemType='Exceptional')%>%
+  rbind(as.data.frame(L2$pts) %>%
+  rename('p(corr)'=V2,
+        'log(rt)'=V1) %>%
+  mutate(ProblemType='Common')) %>%
+  mutate(rt = exp(`log(rt)`)) %>%
+  mutate(rt_2 = rt*rt)
+
+
+## Compare linear vs curvilinear fits for problem types
+
+# Linear Model for Exceptional Problems
+lin_exceptional_mod = lm(`p(corr)`~rt, 
+                         data = stats_df %>% filter(ProblemType=='Exceptional'))
+
+# Quadratic Model for Exceptional Problems
+quad_exceptional_mod = lm(`p(corr)`~ rt + I(rt^2), 
+                          data = stats_df %>% filter(ProblemType=='Exceptional'))
+
+
+# Linear Model for Common Problems
+lin_common_mod = lm(`p(corr)`~rt, 
+                    data = stats_df %>% filter(ProblemType=='Common'))
+
+# Linear Model for Exceptional Problems
+quad_common_mod = lm(`p(corr)`~ rt + I(rt^2),
+                     data = stats_df %>% filter(ProblemType=='Common'))
+
+
+# Build data frame that records the variance explained for each model, 
+# as well as the change in R2 with the addition of a quadratic term
+delta_r2_df = data.frame(
+                  ex_lin_r2=summary(lin_exceptional_mod)$r.squared,
+                  ex_quad_r2=summary(quad_exceptional_mod)$r.squared,
+                  delta_ex_r2=summary(quad_exceptional_mod)$r.squared-summary(lin_exceptional_mod)$r.squared,
+                  com_lin_r2=summary(lin_common_mod)$r.squared,
+                  com_quad_r2=summary(quad_common_mod)$r.squared,
+                  delta_com_r2=summary(quad_common_mod)$r.squared-summary(lin_common_mod)$r.squared,
+                  Set = 'Full'
+                  )
+                
+```
+
+
+### SAT by Grade Cohort -- Figure 3B
+
+```{r, include=F}
+
+# By Cohort
+cohorts = unique(full_df_ses$cohort)
+## Loop through each grade cohort and calculate SAT by problem type
+for(this_cohort in cohorts){
+  
+  print(this_cohort)
+  cohort_df = full_df_sat %>% 
+    filter(cohort==this_cohort)
+  print(unique(cohort_df$cohort))
+  ## Generate dataframes that fit with Ben's Code
+  x_rule = gen_x_sdf(cohort_df)
+  x_norule = gen_x_sdf(cohort_df)
+  
+  print(unique(x_rule$cohort))
+  ## QC on data
+  x_rule = qc(x_rule)
+  x_norule = qc(x_norule)
+  
+  ## Fit IRT models
+  rule_irt = irt(x_rule)
+  norule_irt = irt(x_norule)
+  
+  filter_list_rule = c("ProblemType=='Exceptional'",paste0("cohort=='",as.character(this_cohort),"'"))
+  filter_list_norule = c("ProblemType=='Common'",paste0("cohort=='",as.character(this_cohort),"'"))
+  
+  ## Calculate SAT model
+  nms = c("item","id","diff","th","pv","rt", 'ProblemType','cohort','sbac_quartile')
+  rule_inter = interplay(rule_irt,nboot=100,filter=filter_list_rule,nms=nms)
+  norule_inter= interplay(norule_irt,nboot=100,filter=filter_list_norule,nms=nms)
+  
+  # generate plotting data frame for each cohort
+  assign(paste0("plot_df_",this_cohort),
+         as.data.frame(rule_inter$pts) %>% 
+            rename('p(corr)'=V2,
+                  'log(rt)'=V1) %>% 
+            mutate(ProblemType='Exceptional') %>% 
+            rbind(as.data.frame(norule_inter$pts) %>% 
+            rename('p(corr)'=V2,
+                  'log(rt)'=V1) %>% 
+            mutate(ProblemType='Common')) %>% 
+           mutate(cohort=this_cohort))
+  
+  # Build dataframe from SAT results to compare fits of models predicting
+  # probability of a correct response from reaction time with either
+  # linear term or quadratic term 
+  stats_df = as.data.frame(rule_inter$pts) %>% 
+  rename('p(corr)'=V2,
+        'log(rt)'=V1) %>% 
+  mutate(ProblemType='Exceptional')%>% 
+  rbind(as.data.frame(norule_inter$pts) %>% 
+  rename('p(corr)'=V2,
+        'log(rt)'=V1) %>% 
+  mutate(ProblemType='Common')) %>% 
+  mutate(rt = exp(`log(rt)`)) %>% 
+  # mutate_if(is.numeric, scale) %>%
+  mutate(rt_2 = rt*rt)
+  
+  # Fit linear and quadratic models for common problems
+  lin_common_mod = lm(`p(corr)`~rt, data = stats_df %>% filter(ProblemType=='Common'))
+  quad_common_mod = lm(`p(corr)`~ rt + I(rt^2), data = stats_df %>%
+                         filter(ProblemType=='Common'))
+  
+  # Fit linear and quadratic models for exceptional problems
+  lin_exceptional_mod = lm(`p(corr)`~rt, data = stats_df %>% filter(ProblemType=='Exceptional'))
+  quad_exceptional_mod = lm(`p(corr)`~ rt + I(rt^2), data = stats_df %>%
+                         filter(ProblemType=='Exceptional'))
+  
+  # Add cohort level information about change in R2 to existing dataframe
+  delta_r2_df = delta_r2_df %>% 
+     rbind(data.frame(ex_lin_r2=summary(lin_exceptional_mod)$r.squared,
+                         ex_quad_r2=summary(quad_exceptional_mod)$r.squared,
+                         delta_ex_r2=summary(quad_exceptional_mod)$r.squared-summary(lin_exceptional_mod)$r.squared,
+                         com_lin_r2=summary(lin_common_mod)$r.squared,
+                         com_quad_r2=summary(quad_common_mod)$r.squared,
+                         delta_com_r2=summary(quad_common_mod)$r.squared-summary(lin_common_mod)$r.squared,
+                         Set = paste0('Cohort ',this_cohort)))
+
+}
+
+# Generate Figure 3B
+cohort_sat_plot = plot_df_0 %>% 
+  rbind(plot_df_1) %>% 
+  rbind(plot_df_2) %>% 
+  mutate(cohort = case_when(cohort==0~'Third Grade',
+                            cohort==1~'Fifth Grade',
+                            cohort==2~'Seventh Grade')) %>% 
+  mutate(cohort = factor(cohort, levels=c('Third Grade','Fifth Grade', 'Seventh Grade'))) %>% 
+  mutate(rt = exp(`log(rt)`))%>% 
+  ggplot(aes(x=rt,y=`p(corr)`,color=ProblemType))+
+  geom_line()+
+  geom_ribbon(aes(ymin=cil,ymax=cih,fill=ProblemType),
+              alpha = 0.2,colour = NA)+
+  theme_classic()+
+  theme(legend.position = 'bottom')+
+  facet_grid(.~cohort)+
+  ylab("P(Correct)")+
+  xlab("Reaction Time")+
+  ggtitle("Grade")+
+  labs(color = "Problem Set", fill = "Problem Set")
+
+
+```
+
+
+### SAT by SBAC Quartile -- Figure 3C
+
+```{r, include=F}
+# By SBAC
+
+quartiles = unique(full_df_sat$sbac_quartile)
+# Loop through the SBAC Quartiles
+for(this_quartile in sort(quartiles)){
+  
+  print(this_cohort)
+  cohort_df = full_df_sat %>%
+    filter(sbac_quartile==this_quartile)
+  print(unique(cohort_df$sbac_quartile))
+  ## Generate dataframes that fit with Ben's Code
+  x_rule = gen_x_sdf(cohort_df)
+  x_norule = gen_x_sdf(cohort_df)
+  
+  print(unique(x_rule$cohort))
+  ## QC on data
+  x_rule = qc(x_rule)
+  x_norule = qc(x_norule)
+  
+  ## Fit IRT models
+  rule_irt = irt(x_rule)
+  norule_irt = irt(x_norule)
+  
+  filter_list_rule = c("ProblemType=='Exceptional'",paste0("sbac_quartile=='",as.character(this_quartile),"'"))
+  
+  filter_list_norule = c("ProblemType=='Common'",paste0("sbac_quartile=='",as.character(this_quartile),"'"))
+  
+  ## Calculate SAT model
+  nms = c("item","id","diff","th","pv","rt", 'ProblemType','cohort','sbac_quartile')
+  rule_inter = interplay(rule_irt,nboot=100,filter=filter_list_rule,nms=nms)
+  norule_inter= interplay(norule_irt,nboot=100,filter=filter_list_norule,nms=nms)
+  
+  # Generate dataframe for plotting for each quartile
+  assign(paste0("plot_df_",this_quartile),
+         as.data.frame(rule_inter$pts) %>% 
+            rename('p(corr)'=V2,
+                  'log(rt)'=V1) %>% 
+            mutate(ProblemType='Exceptional') %>% 
+            rbind(as.data.frame(norule_inter$pts) %>% 
+            rename('p(corr)'=V2,
+                  'log(rt)'=V1) %>% 
+            mutate(ProblemType='Common')) %>% 
+           mutate(sbac_quartile=this_quartile))
+  
+  # Build dataframe from SAT results to compare fits of models predicting
+  # probability of a correct response from reaction time with either
+  # linear term or quadratic term 
+  stats_df = as.data.frame(rule_inter$pts) %>% 
+    rename('p(corr)'=V2,
+          'log(rt)'=V1) %>% 
+    mutate(ProblemType='Exceptional')%>% 
+    rbind(as.data.frame(norule_inter$pts) %>% 
+    rename('p(corr)'=V2,
+          'log(rt)'=V1) %>% 
+    mutate(ProblemType='Common')) %>% 
+    mutate(rt = exp(`log(rt)`)) %>% 
+    # mutate_if(is.numeric, scale) %>%
+    mutate(rt_2 = rt*rt)
+  
+  # Fit linear and quadratic models for common problems
+  lin_common_mod = lm(`p(corr)`~rt, data = stats_df %>% filter(ProblemType=='Common'))
+  quad_common_mod = lm(`p(corr)`~ rt + I(rt^2), data = stats_df %>%
+                         filter(ProblemType=='Common'))
+
+  # Fit linear and quadratic models for Exceptional problems
+  lin_exceptional_mod = lm(`p(corr)`~rt, data = stats_df %>% filter(ProblemType=='Exceptional'))
+  quad_exceptional_mod = lm(`p(corr)`~ rt + I(rt^2), data = stats_df %>%
+                         filter(ProblemType=='Exceptional'))
+  
+  # Add quartile level information about change in R2 to existing dataframe
+  delta_r2_df = delta_r2_df %>% 
+     rbind(data.frame(ex_lin_r2=summary(lin_exceptional_mod)$r.squared,
+                         ex_quad_r2=summary(quad_exceptional_mod)$r.squared,
+                         delta_ex_r2=summary(quad_exceptional_mod)$r.squared-summary(lin_exceptional_mod)$r.squared,
+                         com_lin_r2=summary(lin_common_mod)$r.squared,
+                         com_quad_r2=summary(quad_common_mod)$r.squared,
+                         delta_com_r2=summary(quad_common_mod)$r.squared-summary(lin_common_mod)$r.squared,
+                         Set = paste0('Quartile ', this_quartile)))
+}
+
+# Build Figure 3C
+sbac_sat_plot = plot_df_1 %>% 
+  rbind(plot_df_2) %>% 
+  rbind(plot_df_3) %>% 
+  rbind(plot_df_4) %>% 
+    mutate(rt = exp(`log(rt)`),
+           sbac_quartile = case_when(sbac_quartile==1~'Lowest',
+                                     sbac_quartile==2~'Low',
+                                     sbac_quartile==3~'High',
+                                     sbac_quartile==4~'Highest'))%>% 
+  mutate(sbac_quartile = factor(sbac_quartile,  
+                                   levels=c("Lowest","Low","High","Highest"))) %>% 
+  ggplot(aes(x=rt,y=`p(corr)`,color=ProblemType))+
+  geom_line()+
+  theme_classic()+
+  geom_ribbon(aes(ymin=cil,ymax=cih,fill=ProblemType),
+              alpha = 0.2,colour = NA)+
+  facet_grid(.~sbac_quartile)+
+  theme(legend.position="bottom")+
+  ylab("P(Correct)")+
+  xlab("Reaction Time")+
+  ggtitle("SBAC Quartile")+
+  labs(color = "Problem Set", fill = "Problem Set")
+
+```
+
+
+## Figure 3
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+## Figure 3
+(sat_plot + (cohort_sat_plot/sbac_sat_plot))+
+  plot_annotation(tag_levels = 'A')+
+  plot_layout(guides = "collect") &
+  theme(legend.position='bottom',
+        plot.tag = element_text(size = 20, hjust = 0, vjust = 0))
+
+
+
+```
+
+### SAT analysis by SBAC decile
+
+```{r, include=F}
+delta_r2_df_dec = data.frame()
+anova_df = data.frame()
+
+deciles = unique(full_df_sat$sbac_decile)
+for(this_decile in deciles){
+  
+  decile_df = full_df_sat%>%
+    filter(sbac_decile==this_decile)
+
+  ## Generate dataframes that fit with Ben's Code
+  x_rule = gen_x_sdf(decile_df)
+  x_norule = gen_x_sdf(decile_df)
+  
+  ## QC on data
+  x_rule = qc(x_rule)
+  x_norule = qc(x_norule)
+  
+  ## Fit IRT models
+  rule_irt = irt(x_rule)
+  norule_irt = irt(x_norule)
+  
+  filter_list_rule = c("ProblemType=='Exceptional'",paste0("sbac_decile=='",as.character(this_decile),"'"))
+  filter_list_norule = c("ProblemType=='Common'",paste0("sbac_decile=='",as.character(this_decile),"'"))
+  
+  ## Calculate SAT model
+  nms = c("item","id","diff","th","pv","rt", 'ProblemType','cohort','sbac_decile')
+  rule_inter = interplay(rule_irt,nboot=100,filter=filter_list_rule,nms=nms)
+  norule_inter= interplay(norule_irt,nboot=100,filter=filter_list_norule,nms=nms)
+  
+  assign(paste0("plot_df_",this_decile),
+         as.data.frame(rule_inter$pts) %>% 
+            rename('p(corr)'=V2,
+                  'log(rt)'=V1) %>% 
+            mutate(ProblemType='Exceptional') %>% 
+            rbind(as.data.frame(norule_inter$pts) %>% 
+            rename('p(corr)'=V2,
+                  'log(rt)'=V1) %>% 
+            mutate(ProblemType='Common')) %>% 
+           mutate(sbac_decile=this_decile))
+  
+  stats_df = as.data.frame(rule_inter$pts) %>% 
+    rename('p(corr)'=V2,
+          'log(rt)'=V1) %>% 
+    mutate(ProblemType='Exceptional')%>% 
+    rbind(as.data.frame(norule_inter$pts) %>% 
+    rename('p(corr)'=V2,
+          'log(rt)'=V1) %>% 
+    mutate(ProblemType='Common')) %>% 
+    mutate(rt = exp(`log(rt)`)) %>% 
+    # mutate_if(is.numeric, scale) %>%
+    mutate(rt_2 = rt*rt)
+  
+  # Fit linear and quadratic models for Common problems
+  lin_common_mod = lm(`p(corr)`~rt, data = stats_df %>% filter(ProblemType=='Common'))
+  quad_common_mod = lm(`p(corr)`~ rt + I(rt^2), data = stats_df %>%
+                         filter(ProblemType=='Common'))
+  
+  # Fit linear and quadratic models for Exceptional problems
+  lin_exceptional_mod = lm(`p(corr)`~rt, data = stats_df %>% filter(ProblemType=='Exceptional'))
+  quad_exceptional_mod = lm(`p(corr)`~ rt + I(rt^2), data = stats_df %>%
+                         filter(ProblemType=='Exceptional'))
+  
+  
+  delta_r2_df_dec = delta_r2_df_dec %>% 
+     rbind(data.frame(ex_lin_r2=summary(lin_exceptional_mod)$r.squared,
+                      ex_quad_r2=summary(quad_exceptional_mod)$r.squared,
+                      delta_ex_r2=summary(quad_exceptional_mod)$r.squared-summary(lin_exceptional_mod)$r.squared,
+                         com_lin_r2=summary(lin_common_mod)$r.squared,
+                         com_quad_r2=summary(quad_common_mod)$r.squared,
+                         delta_com_r2=summary(quad_common_mod)$r.squared-summary(lin_common_mod)$r.squared,
+                         Set = paste0('decile ',this_decile)))
+
+  
+}
+```
+
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+# pivot longer to create t-test df
+t_data = delta_r2_df_dec %>% 
+  select(Set, delta_com_r2,delta_ex_r2) %>% 
+  pivot_longer(cols=c('delta_com_r2','delta_ex_r2'),
+               names_to='problem', values_to = 'deltaR2') 
+
+t_data_wide = delta_r2_df_dec %>% 
+  select(Set, delta_com_r2,delta_ex_r2)
+
+# compare change in R2 across linear and quadratic decile models
+t.test(t_data_wide$delta_com_r2,
+       t_data_wide$delta_ex_r2,
+       alternative = 'two.sided',
+       var.equal = T,paired=T)
+
+# Calculate effect size for difference in R2 across decile models
+cohens_d(t_data_wide$delta_com_r2,
+       t_data_wide$delta_ex_r2,
+       alternative = 'two.sided',
+       var.equal = F,paired=T)
+
+```
+# Supplemental Figures
+
+## Supplemental Figure 1
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+
+full_df %>% 
+  mutate(cohort = as.factor(cohort),
+         `Problem Type` = if_else(class=='Standard','Common','Exceptional'),
+         firstButtonRT = firstButtonRT*1000) %>%
+  group_by(pid,cohort,`Problem Type`) %>% 
+  dplyr::summarise(count = n(), 
+            first_rt = mean(firstButtonRT,na.rm=T),
+            total_rt = mean(rt,na.rm=T)) %>% 
+  pivot_longer(cols=contains('_rt'),names_to = 'rt_type',values_to='rt')%>% 
+  ungroup() %>% 
+  group_by(cohort,rt_type,`Problem Type`) %>% 
+  summarise(cohort_mean_rt = mean(rt, na.rm=T),
+            std_dev = sd(rt,na.rm=T),
+            count = n())%>% 
+  mutate(se = std_dev/sqrt(count),
+         lower.ci = cohort_mean_rt - qt(1 - (0.05 / 2), count - 1) * se,
+         upper.ci = cohort_mean_rt + qt(1 - (0.05 / 2), count - 1) * se)%>% 
+  mutate(cohort = case_when(cohort == 0~"3",
+                            cohort == 1~"5",
+                            cohort == 2~"7"),
+         rt_type = case_when(rt_type=='first_rt'~'First Button Press',
+                             rt_type=='total_rt'~'Submit Press'))%>% 
+  ggplot(aes(x = cohort, y = cohort_mean_rt,color = rt_type,group=rt_type))+
+  geom_point()+
+  geom_line()+
+  geom_ribbon(aes(ymin = lower.ci, ymax= upper.ci, fill = rt_type), alpha = 0.2,colour = NA)+
+  ylab("Time (ms)")+
+  labs(color = "Reaction Time Type", fill = "Reaction Time Type")+
+  xlab("Grade")+
+  theme_classic()+
+  facet_grid(.~`Problem Type`)
+
+```
+
+
+## Supplemental Figure 2
+
+```{r s2, echo = FALSE, message=FALSE, warning = FALSE}
+
+
+probsize_op_plot_rt = full_df_ses %>%
+  # filter(timepoint==0) %>%
+    filter(class=='Standard') %>%
+    filter(!is.na(class)) %>% 
+    filter(module=='MATH_FLUENCY') %>%
+  # filter(operand_distance!=8) %>% 
+  mutate(operation_type=if_else(operation_type == 'addition',
+                                "Addition","Subtraction")) %>%
+  group_by(pid, cohort, problem_size,low_income,operation_type) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(cohort=as.factor(cohort+3+cohort)) %>% 
+  ggplot(aes(x = problem_size, y = rt,
+             color=cohort, fill=cohort))+
+  geom_smooth(method='lm')+
+  ylab("Reaction Time (s)")+
+  xlab("Set Size")+
+  labs(color = "Grade", fill = 'Grade')+
+  # ggtitle("RPM by Set Size")+
+  theme_classic()+
+  facet_wrap(.~operation_type, scale='free_x')
+
+problem_type_plot_rt = full_df_ses %>%
+  # rename(`Problem Type` = fluency_type) %>% 
+  mutate(`Problem Type` = if_else(class=='Standard','Common','Exceptional')) %>%
+    filter(!is.na(class)) %>% 
+    filter(module=='MATH_FLUENCY') %>%
+  # filter(operand_distance!=8) %>% 
+  group_by(pid, grade,`Problem Type`) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(accuracy=sum_corr/count) %>%
+  group_by(grade,`Problem Type`) %>%
+  summarise(count=n(),
+            mean_rt = mean(rt, na.rm=T),
+            sd_rt = sd(rt, na.rm=T)) %>% 
+      mutate(se = sd_rt/sqrt(count),
+             lower.ci = mean_rt - qt(1 - (0.05 / 2), count - 1) * se,
+             upper.ci = mean_rt + qt(1 - (0.05 / 2), count - 1) * se)%>%
+  ggplot(aes(x = grade, y = mean_rt))+
+  geom_point(aes(color = `Problem Type`))+
+  geom_line(aes(color = `Problem Type`))+
+  geom_ribbon(aes(ymin=lower.ci,ymax=upper.ci,fill=`Problem Type`),alpha=0.25)+
+  ylab("Reaction Time (s)")+
+  xlab("Grade")+
+  labs(color = "Problem Set", fill = "Problem Set")+
+  # ggtitle("RPM by Problem Type")+
+  theme_classic()
+
+
+
+((probsize_op_plot_rt|problem_type_plot_rt))& theme(legend.position = 'bottom')
+
+```
+
+### Supplemental Figure 3
+
+```{r s3, echo = FALSE, message=FALSE, warning = FALSE}
+
+operation_probsize_plot_acc = full_df_ses %>%
+  # filter(timepoint==0) %>% 
+  filter(!is.na(class)) %>% 
+  # filter(class=='Standard') %>% 
+  filter(module=='MATH_FLUENCY') %>% 
+  mutate(operation_type=if_else(operation_type == 'addition',
+                                "Addition","Subtraction"),
+         cohort=as.factor(cohort+3+cohort)) %>%
+  group_by(pid, cohort, problem_size,low_income,operation_type) %>%
+  dplyr::summarise(count = n(),
+            acc = sum(answered_correctly, na.rm = T)/n(),
+            rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>% 
+  ggplot(aes(x = problem_size, y = acc, group=cohort,
+             color = cohort, fill= cohort))+
+  geom_smooth(method='lm')+
+  ylab("Accuracy")+
+  xlab("Operation")+
+  labs(color = "Grade", fill = "Grade")+
+  # ggtitle("RPM by Operation Type")+
+  theme_classic()+
+  facet_grid(.~operation_type, scale='free_x')
+
+
+problem_type_plot_acc = full_df %>%
+  # rename(`Problem Type` = fluency_type) %>% 
+  mutate(`Problem Type` = if_else(class=='Standard','Common','Exceptional')) %>%
+    filter(!is.na(class)) %>% 
+    filter(module=='MATH_FLUENCY') %>%
+  # filter(operand_distance!=8) %>% 
+  group_by(pid, grade,`Problem Type`) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(accuracy=sum_corr/count) %>%
+  group_by(grade,`Problem Type`) %>%
+  summarise(count=n(),
+            mean_acc = mean(accuracy, na.rm=T),
+            sd_acc = sd(accuracy, na.rm=T)) %>% 
+      mutate(se = sd_acc/sqrt(count),
+             lower.ci = mean_acc - qt(1 - (0.05 / 2), count - 1) * se,
+             upper.ci = mean_acc + qt(1 - (0.05 / 2), count - 1) * se)%>%
+  ggplot(aes(x = grade, y = mean_acc))+
+  geom_point(aes(color = `Problem Type`))+
+  geom_line(aes(color = `Problem Type`))+
+  geom_ribbon(aes(ymin=lower.ci,ymax=upper.ci,fill=`Problem Type`),alpha=0.25)+
+  ylab("Accuracy")+
+  xlab("Grade")+
+  labs(color = "Problem Set", fill = "Problem Set")+
+  # ggtitle("RPM by Problem Type")+
+  theme_classic()
+
+
+
+((operation_probsize_plot_acc|problem_type_plot_acc))& theme(legend.position = 'bottom')
+
+
+```
+
+
+### Supplemental Figure 4
+ 
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+
+
+delta_r2_df %>% 
+  # filter(str_contains(Set, 'decile')==F) %>% 
+  select(Set, delta_com_r2,delta_ex_r2) %>% 
+  pivot_longer(cols=c('delta_com_r2','delta_ex_r2'),
+               names_to='Problem Set', values_to = 'Delta R2') %>% 
+  mutate(`Problem Set` = case_when(`Problem Set` == 'delta_com_r2' ~ 'Common',
+                                   `Problem Set` == 'delta_ex_r2' ~ 'Exceptional'),
+         Set = case_when(Set == 'Quartile 1' ~ "SBAC Quartile: Lowest",
+                         Set == 'Quartile 2' ~ "SBAC Quartile: Low",
+                         Set == 'Quartile 3' ~ "SBAC Quartile: High",
+                         Set == 'Quartile 4' ~ "SBAC Quartile: Highest",
+                         T~Set)) %>% 
+  mutate(Set = factor(Set, levels = c("Full", "Cohort 0", "Cohort 1", "Cohort 2", 
+                                      "SBAC Quartile: Lowest","SBAC Quartile: Low",
+                                      "SBAC Quartile: High", "SBAC Quartile: Highest"))) %>% drop_na() %>% 
+  ggplot(aes(x=Set, y = `Delta R2`,fill=`Problem Set`))+
+  geom_col(position='dodge')+
+  theme_bw()+
+   theme(axis.text.x = element_text(angle = 45, hjust=1))+
+  ggtitle("Change in R2 with the Addition of Quadratic Term")
+
+
+```
+
+### Supplemental Table 1
+
+# Examine Multiplication vs Addition/Subtraction Completion
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+# Load Raw Data
+t0_sea <- read_csv("/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/most updated data/t1_SEA_All_correctednamesdemo_rmdups_2020-02-28.csv",
+                   col_types = cols(rt = col_character(),
+                                    grade = col_character(),
+                                    time = col_character(),
+                                    trial_onset = col_character()))
+# 977 completed math fluency
+t0_sea %>% 
+  filter(module=='MATH_FLUENCY') %>% 
+  select(pid, question_text, operation_type, question_id) %>% 
+  group_by(pid, operation_type) %>% 
+  summarise(count=n()) %>% 
+  ungroup() %>% 
+  group_by(operation_type) %>% 
+  mutate(number_ind_response = n()) %>% 
+  ungroup() %>% 
+  select(operation_type, number_ind_response) %>% 
+  unique()%>% 
+  mutate(perc = number_ind_response/977) 
+
+
+mult_df = t0_sea %>% 
+  filter(module=='MATH_FLUENCY') %>% 
+  select(pid, operation_type) %>% 
+  unique() %>% 
+  group_by(pid) %>% 
+  summarise(count=n()) %>% 
+  mutate(did_mult = if_else(count==3, 1, 0)) %>% 
+  select(pid, did_mult)
+  
+
+t0_sea %>% 
+  filter(module=='MATH_FLUENCY') %>% 
+  mutate(fluency_type = case_when(str_detect(question_text, "\\+ 10") ~ "Common",      
+                                  str_detect(question_text, "\\- 1") ~ "Exceptional",          
+                                  str_detect(question_text, "\\+ 1") ~ "Exceptional",
+                                  str_detect(question_text, "\\- 0") ~ "Exceptional",
+                                  str_detect(question_text, "\\+ 0") ~ "Exceptional",
+                                  str_detect(question_text, "1 \\+") ~ "Exceptional",
+                                  str_detect(question_text, "1 \\-") ~ "Exceptional",
+                                  str_detect(question_text, "10 \\+") ~ "Common",
+                                  str_detect(question_text, "0 \\+") ~ "Exceptional",
+                                  str_detect(question_text, "1 \\+ 1") ~ "Exceptional",
+                                  str_detect(question_text, "1 \\- 1") ~ "Exceptional",
+                                  str_detect(question_text, "2 \\+ 2") ~ "Exceptional",
+                                  str_detect(question_text, "2 \\- 2") ~ "Exceptional",
+                                  str_detect(question_text, "3 \\+ 3") ~ "Exceptional",
+                                  str_detect(question_text, "3 \\- 3") ~ "Exceptional",
+                                  str_detect(question_text, "4 \\+ 4") ~ "Exceptional",
+                                  str_detect(question_text, "4 \\- 4") ~ "Exceptional",
+                                  str_detect(question_text, "5 \\+ 5") ~ "Exceptional",
+                                  str_detect(question_text, "5 \\- 5") ~ "Exceptional",
+                                  str_detect(question_text, "6 \\+ 6") ~ "Exceptional",
+                                  str_detect(question_text, "6 \\- 6") ~ "Exceptional",
+                                  str_detect(question_text, "7 \\+ 7") ~ "Exceptional",
+                                  str_detect(question_text, "7 \\- 7") ~ "Exceptional",
+                                  str_detect(question_text, "8 \\+ 8") ~ "Exceptional",
+                                  str_detect(question_text, "8 \\- 8") ~ "Exceptional",
+                                  str_detect(question_text, "9 \\+ 9") ~ "Exceptional",
+                                  str_detect(question_text, "9 \\- 9") ~ "Exceptional",
+                                  str_detect(question_text, "\\* 1") ~ "Filler",
+                                  str_detect(question_text, "1 \\*") ~ "Filler",
+                                  str_detect(question_text, "\\* 0") ~ "Filler",
+                                  str_detect(question_text, "0 \\*") ~ "Filler",
+                                  str_detect(question_text, "x") ~ "Filler",
+                                  TRUE ~ "Common"))%>% 
+  select(question_text, fluency_type)%>% 
+  group_by(question_text,fluency_type) %>% 
+  summarise(count=n())%>% 
+  arrange(desc(fluency_type),question_text)
+
+
+```
+
+### Analysis for Supplemental Text
+
+## Set Size*Operation -- Full Sample -- Supplement
+```{r supplemental analyses, echo = FALSE, message=FALSE, warning = FALSE}
+
+setsize_plot = full_df %>%
+  group_by(pid, cohort, problem_size,operation_type) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(cohort=as.factor(cohort+3+cohort)) %>% 
+  ggplot(aes(x = problem_size, y = rcs,
+             color=cohort,fill = cohort, group=cohort))+
+  geom_smooth(method='lm')+
+  ylab("Correct Responses per Minute")+
+  xlab("Set Size")+
+  labs(color = "Grade", fill = "Grade")+
+  theme_classic()+
+  facet_grid(.~operation_type, scales='free_x')+
+  ylim(19,42)
+
+setsize_mod_data = full_df %>%
+    filter(module=='MATH_FLUENCY') %>% 
+  group_by(pid, cohort, problem_size,operation_type) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>% 
+  ungroup() %>% 
+  unique()
+
+
+setsize_mod_full = lmer(rcs ~ problem_size*operation_type*cohort+(1|pid), data = setsize_mod_data)
+
+summary(setsize_mod_full)
+
+effect_size_calc(setsize_mod_full) %>% 
+  select(Effect, Rsq)
+
+```
+### Problem Type -- Full Sample  -- Supplement
+```{r problem_type_supp, echo = FALSE, message=FALSE, warning = FALSE}
+problem_type_plot = full_df %>%
+  mutate(`Problem Type` = if_else(class=='Standard','Common','Exceptional')) %>%
+    filter(!is.na(class)) %>% 
+    filter(module=='MATH_FLUENCY') %>%
+  group_by(pid, grade,`Problem Type`) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(accuracy=sum_corr/count) %>%
+  group_by(grade,`Problem Type`) %>%
+  summarise(count=n(),
+            mean_rpm = mean(rcs, na.rm=T),
+            sd_rpm = sd(rcs, na.rm=T)) %>% 
+      mutate(se = sd_rpm/sqrt(count),
+             lower.ci = mean_rpm - qt(1 - (0.05 / 2), count - 1) * se,
+             upper.ci = mean_rpm + qt(1 - (0.05 / 2), count - 1) * se)%>%
+  ggplot(aes(x = grade, y = mean_rpm))+
+  geom_point(aes(color = `Problem Type`))+
+  geom_line(aes(color = `Problem Type`))+
+  geom_ribbon(aes(ymin=lower.ci,ymax=upper.ci,fill=`Problem Type`),alpha=0.25)+
+  ylab("Correct Responses per Minute")+
+  xlab("Grade")+
+  labs(color = "Problem Set", fill = "Problem Set")+
+  # ggtitle("RPM by Problem Type")+
+  theme_classic()+
+  ylim(19,42)
+
+mod_data = full_df %>%
+    mutate(ProblemType = if_else(class=='Standard','Standard','Non-Standard')) %>%
+  # filter(timepoint==0) %>%
+    # filter(class=='Standard') %>% 
+    filter(!is.na(class)) %>% 
+    filter(module=='MATH_FLUENCY') %>%
+  # filter(operand_distance!=8) %>% 
+  mutate(operand_distance=as.factor(operand_distance)) %>% 
+  group_by(pid, cohort, ProblemType) %>%
+  dplyr::summarise(count = n(),
+            sum_corr = sum(answered_correctly, na.rm = T),
+            mean_rt = mean(firstButtonRT, na.rm = T),
+            rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>% 
+  ungroup() 
+
+probTypeMod_full = lmer(rcs ~ ProblemType*cohort + (1|pid), data = mod_data)
+
+summary(probTypeMod_full)
+
+effect_size_calc(probTypeMod_full) %>% 
+  select(Effect,Rsq)
+
+```
+
+## Corrected p-values
+
+```{r, echo = FALSE, message=FALSE, warning = FALSE}
+
+## Get FDR Corrected p-values for effects
+
+probSum = as.data.frame(summary(probTypeMod_full)$coefficients) %>% 
+  mutate(model="Problem Type")
+
+setSizeSum = as.data.frame(summary(setsize_mod_full)$coefficients) %>% 
+  mutate(model="SetSize")
+
+# Print adjusted p-values
+probSum %>% 
+  rbind(setSizeSum) %>% 
+  mutate(p.adj_fdr = p.adjust(`Pr(>|t|)`,"fdr"),
+         p.adj_bonf = p.adjust(`Pr(>|t|)`,"bonf")) %>% 
+  select(model, p.adj_fdr,p.adj_bonf)
+
+
+```
