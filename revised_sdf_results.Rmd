@@ -124,6 +124,20 @@ gen_val = function(df, cutoff) {
 
 ```{r, include=F}
 
+# Load Raw Data
+  t0_sea <- read_csv("/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/most updated data/t1_SEA_All_correctednamesdemo_rmdups_2020-02-28.csv",
+                   col_types = cols(rt = col_character(),
+                                    grade = col_character(),
+                                    time = col_character(),
+                                    trial_onset = col_character()))
+
+did_mult = t0_sea %>%
+  filter(module=='MATH_FLUENCY') %>% 
+  filter(operation_type=='multiplication') %>% 
+  select(pid) %>% 
+  unique()
+
+## Load Cleaned Data
 ## if this isn't present, run math_fluency_cleaning.R
 full_df = read_csv('/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/most updated data/sea_math_fluency_cleaned.csv')
 
@@ -162,7 +176,7 @@ full_df = full_df %>%
                                  operand_distance < 5~'Small')) 
 
 # Load demographic and EF information
-low_income_df = read.csv('low_income_df.csv')
+low_income_df = read.csv('/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/Paper_1_Methods/low_income_df.csv')
 
 # Load information about student school/classroom membership
 class_info_df = read.csv('/Users/Ethan/Documents/Stanford/EdNeuro/UCSF/most updated data/student_class_info.csv')
@@ -1527,7 +1541,7 @@ effect_size_calc(probTypeMod_full) %>%
 
 ```
 
-## Corrected p-values
+### Corrected p-values
 
 ```{r, echo = FALSE, message=FALSE, warning = FALSE}
 
@@ -1546,5 +1560,70 @@ probSum %>%
          p.adj_bonf = p.adjust(`Pr(>|t|)`,"bonf")) %>% 
   select(model, p.adj_fdr,p.adj_bonf)
 
+
+```
+
+
+## Fatigue Effects - Compare 1st and 2nd Quartiles (Top Performers)
+
+```{r}
+
+full_df %>%
+  mutate(did_mult = if_else(pid %in% did_mult$pid,T,F)) %>% 
+  mutate(`Problem Type` = if_else(class=='Standard','Common','Exceptional')) %>%
+    filter(!is.na(class)) %>% 
+    filter(module=='MATH_FLUENCY') %>% 
+  mutate(test_minute = case_when(trial_onset/1000 < 60 ~ 1,
+                                 trial_onset/1000 > 120 ~ 3,
+                                 T~2)) %>% 
+  mutate(trial_onset = trial_onset/1000) %>% 
+  group_by(pid,grade) %>% 
+  mutate(rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>% ungroup() %>% 
+  select(pid,grade,test_minute,rcs,answered_correctly,firstButtonRT,question_text,did_mult) %>% 
+  group_by(did_mult) %>% 
+  mutate(perf_quartile = ntile(rcs, 4)) %>% 
+  select(-rcs) %>% 
+  mutate(perf_quartile = if_else(did_mult==T, 4, perf_quartile)) %>% 
+  filter(perf_quartile==4) %>% 
+  group_by(pid,did_mult,test_minute) %>%
+  summarise(rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T),n_items = n()) %>%
+  ungroup() %>% 
+  group_by(did_mult,test_minute) %>% 
+  summarise(mean_rcs = mean(rcs, na.rm=T),
+            se_rcs = sd(rcs, na.rm=T)/sqrt(n()),
+            mean_nitems = mean(n_items, na.rm=T),
+            count=n()) %>% 
+  mutate(did_mult = if_else(did_mult==T, 'Highest','High'),
+         test_minute = as.factor(test_minute)) %>% 
+  ggplot(aes(x = did_mult, y = mean_rcs, fill = test_minute)) +
+  geom_col(position = position_dodge(width = 0.9)) +  # Group the bars
+  geom_errorbar(aes(ymin = mean_rcs - se_rcs, ymax = mean_rcs + se_rcs),
+                position = position_dodge(width = 0.9), width = 0.25) +  # Add error bars
+  labs(x = "Performance Group", y = "Correct Responses per Minute", fill = "Minute") +  # Labels
+  theme_bw()
+  
+
+stats_df = full_df %>%
+  mutate(did_mult = if_else(pid %in% did_mult$pid,T,F)) %>% 
+  mutate(`Problem Type` = if_else(class=='Standard','Common','Exceptional')) %>%
+    filter(!is.na(class)) %>% 
+    filter(module=='MATH_FLUENCY') %>% 
+  mutate(test_minute = case_when(trial_onset/1000 < 60 ~ 1,
+                                 trial_onset/1000 > 120 ~ 3,
+                                 T~2)) %>% 
+  mutate(trial_onset = trial_onset/1000) %>% 
+  group_by(pid,grade) %>% 
+  mutate(rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T)) %>% ungroup() %>% 
+  select(pid,grade,test_minute,rcs,answered_correctly,firstButtonRT,question_text,did_mult) %>% 
+  group_by(did_mult) %>% 
+  mutate(perf_quartile = ntile(rcs, 4)) %>% 
+  select(-rcs) %>% 
+  mutate(perf_quartile = if_else(did_mult==T, 4, perf_quartile)) %>% 
+  filter(perf_quartile==4) %>% 
+  group_by(pid,did_mult,test_minute) %>%
+  summarise(rcs = (60*sum(answered_correctly, na.rm = T))/sum(firstButtonRT, na.rm = T),n_items = n())
+
+mod = lm(rcs~did_mult*test_minute, data = stats_df)
+summary(mod)
 
 ```
